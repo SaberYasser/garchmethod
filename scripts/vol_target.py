@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["arch>=6.0", "pandas>=2.0", "numpy>=1.24"]
+# dependencies = ["arch>=6.0", "pandas>=2.0", "numpy>=1.24", "yfinance>=0.2"]
 # ///
 """
 vol_target.py — turn a volatility forecast into a position size.

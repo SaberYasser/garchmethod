@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["arch>=6.0", "pandas>=2.0", "numpy>=1.24", "matplotlib>=3.7"]
+# dependencies = ["arch>=6.0", "pandas>=2.0", "numpy>=1.24", "matplotlib>=3.7", "yfinance>=0.2"]
 # ///
 """
 compare.py — the honest test. Same strategy, two position-sizing rules.
