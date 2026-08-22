@@ -27,13 +27,17 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from profiles import add_profile_args, resolve
+
 warnings.filterwarnings("ignore")
 
 TRADING_DAYS_CRYPTO = 365
 TRADING_DAYS_EQUITY = 252
-MIN_TRAIN = 500          # days of history before first forecast
-REFIT_EVERY = 21         # re-estimate params every N days (walk-forward)
-REGIME_LOOKBACK = 365    # window for vol percentile / regime classification
+MIN_TRAIN = 250          # days of history before first forecast
+REFIT_EVERY = 10         # re-estimate params every N days (walk-forward)
+REGIME_LOOKBACK = 180    # window for vol percentile / regime classification
+CALM_PCTILE = 25         # below this percentile -> calm
+STORM_PCTILE = 80        # above this percentile -> storm
 
 HONESTY_NOTE = "GARCH forecasts magnitude (volatility), not direction. It tells you how violent tomorrow is likely to be — not which way it goes."
 
@@ -64,8 +68,9 @@ def load_prices(csv=None, ticker=None):
     return out
 
 
-def walkforward_garch(prices: pd.DataFrame, periods_per_year: int = TRADING_DAYS_CRYPTO,
-                      min_train: int = MIN_TRAIN, refit_every: int = REFIT_EVERY) -> pd.DataFrame:
+def walkforward_garch(prices: pd.DataFrame, periods_per_year: int = TRADING_DAYS_EQUITY,
+                      min_train: int = MIN_TRAIN, refit_every: int = REFIT_EVERY,
+                      regime_lookback: int = REGIME_LOOKBACK) -> pd.DataFrame:
     """
     Walk-forward GARCH(1,1). For each day t >= min_train, forecast the vol of
     day t+1 using ONLY data available at the close of day t.
@@ -96,25 +101,34 @@ def walkforward_garch(prices: pd.DataFrame, periods_per_year: int = TRADING_DAYS
 
     for t in range(min_train, n):
         if (t - min_train) % refit_every == 0:
-            am = arch_model(rets[:t], vol="GARCH", p=1, q=1, mean="Constant", dist="t")
+            # o=1 makes this GJR-GARCH: a separate coefficient on NEGATIVE
+            # shocks, so selloffs raise the vol forecast more than rallies of
+            # the same size. skewt allows a fat, asymmetric tail.
+            am = arch_model(rets[:t], vol="GARCH", p=1, o=1, q=1,
+                            mean="Constant", dist="skewt")
             res = am.fit(disp="off", show_warning=False)
             p = res.params
-            mu, omega, alpha, beta = p["mu"], p["omega"], p["alpha[1]"], p["beta[1]"]
+            mu, omega = p["mu"], p["omega"]
+            alpha, beta, gamma = p["alpha[1]"], p["beta[1]"], p["gamma[1]"]
             sigma2 = float(res.conditional_volatility[-1] ** 2)
-        # roll the recursion one step with today's observed residual
+        # roll the recursion one step with today's observed residual.
+        # GJR: sigma2_next = omega + (alpha + gamma*1[eps<0])*eps^2 + beta*sigma2
+        # The indicator is what makes the forecast asymmetric — without it the
+        # gamma term fitted above would be estimated and then thrown away.
         eps = rets[t] - mu if t > 0 else 0.0
-        # sigma2 currently holds Var estimate for day t; update to t+1:
-        sigma2 = omega + alpha * eps ** 2 + beta * sigma2
+        leverage = gamma if eps < 0 else 0.0
+        sigma2 = omega + (alpha + leverage) * eps ** 2 + beta * sigma2
         fcast_var[t] = sigma2                        # made at close of t, for day t+1
 
     out = prices.iloc[1:].copy().reset_index(drop=True)
     out["ret"] = rets
     out["fcast_vol"] = np.sqrt(fcast_var)                                # daily %
     out["fcast_vol_ann"] = out["fcast_vol"] * np.sqrt(periods_per_year)  # annualized %
-    pct = out["fcast_vol"].rolling(REGIME_LOOKBACK, min_periods=90).apply(
+    pct = out["fcast_vol"].rolling(regime_lookback, min_periods=60).apply(
         lambda w: (w.iloc[:-1] < w.iloc[-1]).mean() * 100 if len(w) > 1 else np.nan, raw=False)
     out["vol_pctile"] = pct
-    out["regime"] = pd.cut(out["vol_pctile"], bins=[-1, 33, 67, 101],
+    out["regime"] = pd.cut(out["vol_pctile"],
+                           bins=[-1, CALM_PCTILE, STORM_PCTILE, 101],
                            labels=["calm", "normal", "storm"])
     return out
 
@@ -123,22 +137,26 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv")
     ap.add_argument("--ticker")
-    ap.add_argument("--periods-per-year", type=int, default=TRADING_DAYS_CRYPTO,
-                    help="365 for crypto (default), 252 for stocks")
     ap.add_argument("--json", action="store_true", help="print latest forecast as JSON")
     ap.add_argument("--out-csv", help="write full walk-forward series to CSV")
+    add_profile_args(ap)
     args = ap.parse_args()
+    cfg = resolve(args)
 
     prices = load_prices(csv=args.csv, ticker=args.ticker)
-    res = walkforward_garch(prices, periods_per_year=args.periods_per_year)
+    res = walkforward_garch(prices, periods_per_year=cfg["periods_per_year"],
+                            min_train=cfg["min_train"], refit_every=cfg["refit_every"],
+                            regime_lookback=cfg["regime_lookback"])
     latest = res.dropna(subset=["fcast_vol"]).iloc[-1]
 
     payload = {
         "asset": args.ticker or args.csv,
+        "profile": args.profile,
+        "model": "GJR-GARCH(1,1,1), skew-t",
         "as_of": str(latest["date"].date()),
         "forecast_vol_daily_pct": round(float(latest["fcast_vol"]), 3),
         "forecast_vol_annualized_pct": round(float(latest["fcast_vol_ann"]), 1),
-        "vol_percentile_1y": round(float(latest["vol_pctile"]), 1) if pd.notna(latest["vol_pctile"]) else None,
+        "vol_percentile": round(float(latest["vol_pctile"]), 1) if pd.notna(latest["vol_pctile"]) else None,
         "regime": str(latest["regime"]),
         "note": HONESTY_NOTE,
     }
@@ -148,10 +166,10 @@ def main():
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print(f"\n  {payload['asset']} — as of {payload['as_of']}")
+        print(f"\n  {payload['asset']} [{args.profile}] — as of {payload['as_of']}")
         print(f"  1-day vol forecast : {payload['forecast_vol_daily_pct']}% daily "
               f"({payload['forecast_vol_annualized_pct']}% annualized)")
-        print(f"  vol percentile (1y): {payload['vol_percentile_1y']}")
+        print(f"  vol percentile     : {payload['vol_percentile']}")
         print(f"  regime             : {payload['regime'].upper()}")
         print(f"\n  ⚠ {HONESTY_NOTE}\n")
 
